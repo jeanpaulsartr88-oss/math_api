@@ -45,7 +45,7 @@ def ask():
 
         # 2. СОЗДАЕМ ИИ ЗДЕСЬ, применяя выбранную инструкцию
         model = genai.GenerativeModel(
-            model_name='gemini-1.5-flash',
+            model_name='gemini-3-flash-preview',
             system_instruction=sys_instruct
         )
 
@@ -66,3 +66,4 @@ def ask():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
+
