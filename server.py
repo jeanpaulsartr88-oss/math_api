@@ -12,9 +12,29 @@ my_secret_key = os.environ.get("GEMINI_API_KEY")
 genai.configure(api_key=my_secret_key)
 
 @app.route('/ask', methods=['POST'])
-def ask_ai():
-    data = request.json
-    user_query = data.get('query', '')
+def ask():
+    try:
+        data = request.get_json()
+        user_query = data.get('query')
+        # Получаем историю переписки от React (если её нет, будет пустой список)
+        front_history = data.get('history', [])
+
+        # Переводим историю в формат, который понимает Gemini
+        gemini_history = []
+        for msg in front_history:
+            role = "user" if msg["role"] == "user" else "model"
+            gemini_history.append({
+                "role": role,
+                "parts": [msg["content"]]
+            })
+
+        # Запускаем специальный режим чата с памятью!
+        chat = model.start_chat(history=gemini_history)
+        response = chat.send_message(user_query)
+        
+        return jsonify({'status': 'success', 'answer': response.text})
+    except Exception as e:
+        return jsonify({'status': 'error', 'answer': str(e)})
     
     # Инструкция для ИИ (адаптирована для показа внутри приложения)
     sys_instruct = """Ты — доброжелательный, терпеливый и педагогически подкованный цифровой наставник по математике. Твоя основная задача — помочь ученику понять и осмыслить математические темы, а не просто дать готовое решение. Твоя речь — простая, короткая, по делу. Помни: цель — обучение, развитие навыков и самостоятельность .
@@ -47,6 +67,7 @@ if __name__ == '__main__':
     # host='0.0.0.0' заставляет сервер слушать все входящие адреса
 
     app.run(host='0.0.0.0', port=5000, debug=True)
+
 
 
 
