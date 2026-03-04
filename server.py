@@ -1,3 +1,4 @@
+import os
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import google.generativeai as genai
@@ -7,7 +8,8 @@ app = Flask(__name__)
 CORS(app) 
 
 # ВАЖНО: Вставьте сюда ваш реальный ключ API от Gemini
-genai.configure(api_key="AIzaSyBM2bf-H9x2wCUFbLbstuE0OInMvzd3540")
+my_secret_key = os.environ.get("GEMINI_API_KEY")
+genai.configure(api_key=my_secret_key)
 
 @app.route('/ask', methods=['POST'])
 def ask_ai():
@@ -48,3 +50,4 @@ if __name__ == '__main__':
     # host='0.0.0.0' заставляет сервер слушать все входящие адреса
 
     app.run(host='0.0.0.0', port=5000, debug=True)
+
