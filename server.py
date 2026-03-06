@@ -112,21 +112,9 @@ def ask():
         profile_key = data.get('profile', 'academic')
         image_b64 = data.get('image') 
 
-        # --- НАСТРОЙКА КЛЮЧА ИЗ КАРУСЕЛИ ---
-        current_key = next(key_cycle)
-        genai.configure(api_key=current_key)
-        
-        # Печатаем в логи Render последние 4 символа ключа, чтобы убедиться, что они меняются
-        if current_key and len(current_key) > 4:
-            print(f"Обработка запроса. Используется ключ: ...{current_key[-4:]}")
-
         sys_instruct = PROFILES.get(profile_key, PROFILES["academic"])
 
-        model = genai.GenerativeModel(
-            model_name='gemini-2.5-flash',
-            system_instruction=sys_instruct
-        )
-
+        # Формируем историю сообщений один раз (до попыток отправки)
         gemini_history = []
         for msg in front_history:
             role = "user" if msg["role"] == "user" else "model"
@@ -135,8 +123,7 @@ def ask():
                 "parts": [msg["content"]]
             })
 
-        chat = model.start_chat(history=gemini_history)
-        
+        # Формируем части текущего запроса один раз (до попыток отправки)
         current_parts = []
         if user_query:
             current_parts.append(user_query)
@@ -149,9 +136,54 @@ def ask():
                 "data": image_b64
             })
 
-        response = chat.send_message(current_parts)
-        
-        return jsonify({'status': 'success', 'answer': response.text})
+        # --- НАЧАЛО БЛОКА АВТОМАТИЧЕСКОГО ПЕРЕКЛЮЧЕНИЯ (RETRY) ---
+        max_retries = len(VALID_KEYS) if VALID_KEYS else 1
+        response = None
+        last_error = None
+
+        for attempt in range(max_retries):
+            # Берем следующий ключ из карусели
+            current_key = next(key_cycle)
+            genai.configure(api_key=current_key)
+            
+            if current_key and len(current_key) > 4:
+                print(f"Попытка {attempt + 1}. Обработка запроса. Используется ключ: ...{current_key[-4:]}")
+
+            try:
+                # Инициализируем модель с текущим ключом
+                model = genai.GenerativeModel(
+                    model_name='gemini-2.5-flash',
+                    system_instruction=sys_instruct
+                )
+
+                # Запускаем чат и пытаемся отправить сообщение
+                chat = model.start_chat(history=gemini_history)
+                response = chat.send_message(current_parts)
+                
+                # Если мы дошли до этой строки, значит ответ получен успешно!
+                # Прерываем цикл перебора ключей
+                break 
+
+            except Exception as e:
+                error_msg = str(e).lower()
+                last_error = e
+                print(f"Ошибка на ключе ...{current_key[-4:]}: {e}")
+                
+                # Проверяем, связана ли ошибка с лимитами
+                if "429" in error_msg or "quota" in error_msg or "exhausted" in error_msg or "too many requests" in error_msg:
+                    print("Лимит исчерпан. Переключаемся на следующий ключ...")
+                    continue # Идем на следующий круг цикла с новым ключом
+                else:
+                    # Если ошибка другая (например, неверный формат картинки), прерываем попытки
+                    break
+        # --- КОНЕЦ БЛОКА АВТОМАТИЧЕСКОГО ПЕРЕКЛЮЧЕНИЯ ---
+
+        # Если цикл закончился и у нас есть response, отправляем его
+        if response:
+            return jsonify({'status': 'success', 'answer': response.text})
+        else:
+            return jsonify({'status': 'error', 'answer': f"Не удалось получить ответ. Последняя ошибка: {str(last_error)}"})
+
     except Exception as e:
         print(f"Server Error: {str(e)}")
         return jsonify({'status': 'error', 'answer': str(e)})
