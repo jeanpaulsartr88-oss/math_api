@@ -1,4 +1,5 @@
 import os
+import itertools
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import google.generativeai as genai
@@ -6,8 +7,26 @@ import google.generativeai as genai
 app = Flask(__name__)
 CORS(app)
 
-my_secret_key = os.environ.get("GEMINI_API_KEY")
-genai.configure(api_key=my_secret_key)
+# --- НАЧАЛО БЛОКА КАРУСЕЛИ КЛЮЧЕЙ ---
+# Собираем все 5 ключей из переменных окружения Render
+API_KEYS = [
+    os.environ.get("GEMINI_API_KEY_1"),
+    os.environ.get("GEMINI_API_KEY_2"),
+    os.environ.get("GEMINI_API_KEY_3"),
+    os.environ.get("GEMINI_API_KEY_4"),
+    os.environ.get("GEMINI_API_KEY_5")
+]
+
+# Оставляем только те ключи, которые реально существуют (не пустые)
+VALID_KEYS = [key for key in API_KEYS if key]
+
+if not VALID_KEYS:
+    print("ВНИМАНИЕ: Не найдено ни одного API ключа! Проверьте настройки Environment на Render.")
+    VALID_KEYS = ["dummy_key"] # Заглушка, чтобы сервер не упал при запуске
+
+# Создаем бесконечную карусель из рабочих ключей
+key_cycle = itertools.cycle(VALID_KEYS)
+# --- КОНЕЦ БЛОКА КАРУСЕЛИ ---
 
 # БАЗА ПРОФИЛЕЙ ТЬЮТОРОВ
 PROFILES = {
@@ -38,7 +57,7 @@ PROFILES = {
 Твои ключевые принципы:
 Скорость превыше всего: Если задачу можно решить за 30 секунд методом исключения или подстановки — научи этому. Время на экзамене — твой главный враг.
 Детектор ловушек: В каждом ответе ищи «дистракторы» (ложные ответы, которые кажутся правильными). Указывай, на чем обычно ловят учеников (например, невнимательность к единицам измерения или «лишние» условия).
-Казахстанский контекст: Все прикладные задачи должны быть связаны с реалиями Казахстана (расстояния между городами — Астана, Алматы, Шымкент, Павлодар; расчеты налогов в тенге; логистика через Каспий и т.д.).
+Казахстанский контекст: Все прикладные задачи должны быть связаны с реалиями Казахстана (расстояния между городами — Астана, Алматы, Шымкент, Павлодар; расчеты налогов в тенге; логистика через Каспий и тдить).
 Суровая поддержка: Ты не сюсюкаешься. Если ученик допускает глупую ошибку, ты прямо говоришь: «На реальном ЕНТ ты бы только что потерял 2 балла и бюджетное место. Давай разберем, почему ты попался».
 Алгоритм разбора любой задачи:
 Этап 1: Суть. Краткое условие.
@@ -91,7 +110,15 @@ def ask():
         user_query = data.get('query')
         front_history = data.get('history', [])
         profile_key = data.get('profile', 'academic')
-        image_b64 = data.get('image') # Получаем картинку в формате Base64
+        image_b64 = data.get('image') 
+
+        # --- НАСТРОЙКА КЛЮЧА ИЗ КАРУСЕЛИ ---
+        current_key = next(key_cycle)
+        genai.configure(api_key=current_key)
+        
+        # Печатаем в логи Render последние 4 символа ключа, чтобы убедиться, что они меняются
+        if current_key and len(current_key) > 4:
+            print(f"Обработка запроса. Используется ключ: ...{current_key[-4:]}")
 
         sys_instruct = PROFILES.get(profile_key, PROFILES["academic"])
 
@@ -110,12 +137,10 @@ def ask():
 
         chat = model.start_chat(history=gemini_history)
         
-        # Формируем текущее сообщение (текст + фото)
         current_parts = []
         if user_query:
             current_parts.append(user_query)
         elif image_b64:
-            # Если ученик прислал только фото без текста
             current_parts.append("Посмотри на это фото и помоги мне найти ошибку или решить задачу.")
             
         if image_b64:
@@ -133,4 +158,3 @@ def ask():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
-
