@@ -1,5 +1,4 @@
 import os
-import itertools
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import google.generativeai as genai
@@ -7,18 +6,15 @@ import google.generativeai as genai
 app = Flask(__name__)
 CORS(app)
 
+# --- НАСТРОЙКА ЕДИНОГО КЛЮЧА ---
 API_KEY = os.environ.get("GOOGLE_API_KEY")
 
-# Оставляем только те ключи, которые реально существуют (не пустые)
-VALID_KEYS = [key for key in API_KEYS if key]
-
-if not VALID_KEYS:
-    print("ВНИМАНИЕ: Не найдено ни одного API ключа! Проверьте настройки Environment на Render.")
-    VALID_KEYS = ["dummy_key"] # Заглушка, чтобы сервер не упал при запуске
-
-# Создаем бесконечную карусель из рабочих ключей
-key_cycle = itertools.cycle(VALID_KEYS)
-# --- КОНЕЦ БЛОКА КАРУСЕЛИ ---
+if not API_KEY:
+    print("КРИТИЧЕСКАЯ ОШИБКА: Ключ GOOGLE_API_KEY не найден в настройках Render!")
+else:
+    # Настраиваем библиотеку один раз при запуске сервера
+    genai.configure(api_key=API_KEY)
+    print("Сервер успешно запущен с API ключом.")
 
 # БАЗА ПРОФИЛЕЙ ТЬЮТОРОВ
 PROFILES = {
