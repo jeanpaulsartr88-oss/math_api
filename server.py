@@ -6,11 +6,11 @@ import google.generativeai as genai
 app = Flask(__name__)
 CORS(app)
 
-# --- НАСТРОЙКА ЕДИНОГО КЛЮЧА ---
+# --- НАСТРОЙКА КЛЮЧА ---
 API_KEY = os.environ.get("GOOGLE_API_KEY")
 
 if not API_KEY:
-    print("КРИТИЧЕСКАЯ ОШИБКА: Ключ GOOGLE_API_KEY не найден в настройках Render!")
+    print("КРИТИЧЕСКАЯ ОШИБКА: Ключ GOOGLE_API_KEY не найден в Render!")
 else:
     # Настраиваем библиотеку один раз при запуске сервера
     genai.configure(api_key=API_KEY)
@@ -90,10 +90,12 @@ PROFILES = {
 СТРОГОЕ ПРАВИЛО: НИКОГДА не вставляй в ответ картинки, графики или ссылки на изображения (формат ![alt](url)). Описывай графики только текстом или схематично символами.
 ВАЖНО: Используй эмодзи и оборачивай математику в $...$ или $$...$$."""
 }
+
 # Специальный маршрут для UptimeRobot (чтобы сервер не спал)
 @app.route('/', methods=['GET'])
 def ping():
     return "Сервер Math Studio активен и готов к работе!", 200
+
 @app.route('/ask', methods=['POST'])
 def ask():
     try:
@@ -105,7 +107,7 @@ def ask():
 
         sys_instruct = PROFILES.get(profile_key, PROFILES["academic"])
 
-        # Формируем историю сообщений один раз (до попыток отправки)
+        # Формируем историю сообщений
         gemini_history = []
         for msg in front_history:
             role = "user" if msg["role"] == "user" else "model"
@@ -114,7 +116,7 @@ def ask():
                 "parts": [msg["content"]]
             })
 
-        # Формируем части текущего запроса один раз (до попыток отправки)
+        # Формируем текущий запрос
         current_parts = []
         if user_query:
             current_parts.append(user_query)
@@ -127,58 +129,21 @@ def ask():
                 "data": image_b64
             })
 
-        # --- НАЧАЛО БЛОКА АВТОМАТИЧЕСКОГО ПЕРЕКЛЮЧЕНИЯ (RETRY) ---
-        max_retries = len(VALID_KEYS) if VALID_KEYS else 1
-        response = None
-        last_error = None
+        # Инициализируем модель
+        model = genai.GenerativeModel(
+            model_name='gemini-2.5-flash',
+            system_instruction=sys_instruct
+        )
 
-        for attempt in range(max_retries):
-            # Берем следующий ключ из карусели
-            current_key = next(key_cycle)
-            genai.configure(api_key=current_key)
-            
-            if current_key and len(current_key) > 4:
-                print(f"Попытка {attempt + 1}. Обработка запроса. Используется ключ: ...{current_key[-4:]}")
-
-            try:
-                # Инициализируем модель с текущим ключом
-                model = genai.GenerativeModel(
-                    model_name='gemini-2.5-flash',
-                    system_instruction=sys_instruct
-                )
-
-                # Запускаем чат и пытаемся отправить сообщение
-                chat = model.start_chat(history=gemini_history)
-                response = chat.send_message(current_parts)
-                
-                # Если мы дошли до этой строки, значит ответ получен успешно!
-                # Прерываем цикл перебора ключей
-                break 
-
-            except Exception as e:
-                error_msg = str(e).lower()
-                last_error = e
-                print(f"Ошибка на ключе ...{current_key[-4:]}: {e}")
-                
-                # Проверяем, связана ли ошибка с лимитами
-                if "429" in error_msg or "quota" in error_msg or "exhausted" in error_msg or "too many requests" in error_msg:
-                    print("Лимит исчерпан. Переключаемся на следующий ключ...")
-                    continue # Идем на следующий круг цикла с новым ключом
-                else:
-                    # Если ошибка другая (например, неверный формат картинки), прерываем попытки
-                    break
-        # --- КОНЕЦ БЛОКА АВТОМАТИЧЕСКОГО ПЕРЕКЛЮЧЕНИЯ ---
-
-        # Если цикл закончился и у нас есть response, отправляем его
-        if response:
-            return jsonify({'status': 'success', 'answer': response.text})
-        else:
-            return jsonify({'status': 'error', 'answer': f"Не удалось получить ответ. Последняя ошибка: {str(last_error)}"})
+        # Отправляем сообщение
+        chat = model.start_chat(history=gemini_history)
+        response = chat.send_message(current_parts)
+        
+        return jsonify({'status': 'success', 'answer': response.text})
 
     except Exception as e:
-        print(f"Server Error: {str(e)}")
-        return jsonify({'status': 'error', 'answer': str(e)})
+        print(f"Ошибка генерации ответа: {str(e)}")
+        return jsonify({'status': 'error', 'answer': f"Ошибка сервера: {str(e)}"})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
-
