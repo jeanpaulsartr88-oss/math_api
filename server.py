@@ -7,15 +7,7 @@ import google.generativeai as genai
 app = Flask(__name__)
 CORS(app)
 
-# --- НАЧАЛО БЛОКА КАРУСЕЛИ КЛЮЧЕЙ ---
-# Собираем все 5 ключей из переменных окружения Render
-API_KEYS = [
-    os.environ.get("GEMINI_API_KEY_1"),
-    os.environ.get("GEMINI_API_KEY_2"),
-    os.environ.get("GEMINI_API_KEY_3"),
-    os.environ.get("GEMINI_API_KEY_4"),
-    os.environ.get("GEMINI_API_KEY_5")
-]
+API_KEY = os.environ.get("GOOGLE_API_KEY")
 
 # Оставляем только те ключи, которые реально существуют (не пустые)
 VALID_KEYS = [key for key in API_KEYS if key]
