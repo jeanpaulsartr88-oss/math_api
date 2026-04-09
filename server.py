@@ -1,4 +1,5 @@
 import os
+import base64  # <-- Добавили библиотеку для работы с картинками
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import google.generativeai as genai
@@ -124,9 +125,18 @@ def ask():
             current_parts.append("Посмотри на это фото и помоги мне найти ошибку или решить задачу.")
             
         if image_b64:
+            # Очищаем строку от префикса фронтенда (если он есть)
+            if "," in image_b64:
+                clean_b64 = image_b64.split(",")[1]
+            else:
+                clean_b64 = image_b64
+                
+            # Переводим текст в настоящие байты (новые требования Google API)
+            image_bytes = base64.b64decode(clean_b64)
+            
             current_parts.append({
                 "mime_type": "image/jpeg",
-                "data": image_b64
+                "data": image_bytes
             })
 
         # Инициализируем модель
