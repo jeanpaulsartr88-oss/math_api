@@ -141,7 +141,7 @@ def ask():
 
         # Инициализируем модель
         model = genai.GenerativeModel(
-            model_name='gemini-2.5-flash',
+            model_name='gemini-3.1-flash-lite',
             system_instruction=sys_instruct
         )
 
