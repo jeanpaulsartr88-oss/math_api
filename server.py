@@ -1,23 +1,152 @@
 import os
-import base64  # <-- Добавили библиотеку для работы с картинками
+import time
+import base64
+import threading
+import logging
+from typing import List, Dict, Optional, Any
+from dataclasses import dataclass
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import google.generativeai as genai
+import requests
+from dotenv import load_dotenv
+
+# Загружаем переменные из .env при локальном запуске
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("MathStudioBackend")
 
 app = Flask(__name__)
 CORS(app)
 
-# --- НАСТРОЙКА КЛЮЧА ---
-API_KEY = os.environ.get("GOOGLE_API_KEY")
+# ==============================================================================
+# 1. КОНФИГУРАЦИЯ И ЗАЩИТА КЛЮЧЕЙ
+# ==============================================================================
 
-if not API_KEY:
-    print("КРИТИЧЕСКАЯ ОШИБКА: Ключ GOOGLE_API_KEY не найден в Render!")
-else:
-    # Настраиваем библиотеку один раз при запуске сервера
-    genai.configure(api_key=API_KEY)
-    print("Сервер успешно запущен с API ключом.")
+# Ключи читаются из переменных окружения Render (GEMINI_API_KEYS или GOOGLE_API_KEY)
+RAW_KEYS = os.environ.get("GEMINI_API_KEYS", "").strip()
+if not RAW_KEYS:
+    RAW_KEYS = os.environ.get("GOOGLE_API_KEY", "").strip()
 
-# БАЗА ПРОФИЛЕЙ ТЬЮТОРОВ
+API_KEYS = [k.strip() for k in RAW_KEYS.split(",") if k.strip()]
+
+MODELS = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite-preview"
+]
+
+SLOT_SPACING_SECONDS = 4.0        # Минимальный интервал между вызовами одного слота
+COOLDOWN_ON_LIMIT_SECONDS = 60.0  # Кулдаун при 429 / 403 / 400
+COOLDOWN_ON_ERROR_SECONDS = 15.0  # Кулдаун при 5xx
+
+
+# ==============================================================================
+# 2. МУЛЬТИПЛЕКСНЫЙ ПУЛ (MULTI-KEY & MULTI-MODEL POOL)
+# ==============================================================================
+
+@dataclass
+class ChannelSlot:
+    slot_id: str
+    key: str
+    model: str
+    last_called_at: float = 0.0
+    cooldown_until: float = 0.0
+    total_calls: int = 0
+    consecutive_errors: int = 0
+
+    @property
+    def is_available(self) -> bool:
+        return time.time() >= self.cooldown_until
+
+    @property
+    def time_until_ready(self) -> float:
+        now = time.time()
+        spacing_wait = max(0.0, (self.last_called_at + SLOT_SPACING_SECONDS) - now)
+        cooldown_wait = max(0.0, self.cooldown_until - now)
+        return max(spacing_wait, cooldown_wait)
+
+
+class GeminiMultiPool:
+    def __init__(self, keys: List[str], models: List[str]):
+        self.slots: List[ChannelSlot] = []
+        self._pointer = 0
+        self._lock = threading.Lock()
+        self._models = models
+
+        self.reconfigure(keys)
+
+    def reconfigure(self, keys: List[str]):
+        with self._lock:
+            self.slots = []
+            for k_idx, key in enumerate(keys, start=1):
+                for model in self._models:
+                    slot_id = f"K{k_idx:02d}_{model}"
+                    self.slots.append(ChannelSlot(slot_id=slot_id, key=key, model=model))
+            logger.info(f"Инициализирован пул ротации: {len(self.slots)} каналов.")
+
+    def acquire_slot(self) -> ChannelSlot:
+        with self._lock:
+            if not self.slots:
+                # Попытка перечитать ключи на лету
+                latest_keys = [k.strip() for k in (os.environ.get("GEMINI_API_KEYS", "") or os.environ.get("GOOGLE_API_KEY", "")).split(",") if k.strip()]
+                if latest_keys:
+                    self.reconfigure(latest_keys)
+                else:
+                    raise RuntimeError("API-ключи не найдены в переменных окружения GEMINI_API_KEYS / GOOGLE_API_KEY.")
+
+            n = len(self.slots)
+            best_slot: Optional[ChannelSlot] = None
+            min_wait = float("inf")
+
+            for i in range(n):
+                idx = (self._pointer + i) % n
+                slot = self.slots[idx]
+
+                if slot.is_available:
+                    wait_time = max(0.0, (slot.last_called_at + SLOT_SPACING_SECONDS) - time.time())
+                    if wait_time == 0:
+                        self._pointer = (idx + 1) % n
+                        slot.last_called_at = time.time()
+                        slot.total_calls += 1
+                        return slot
+
+                    if wait_time < min_wait:
+                        min_wait = wait_time
+                        best_slot = slot
+
+            if best_slot is None:
+                best_slot = min(self.slots, key=lambda s: s.time_until_ready)
+                min_wait = best_slot.time_until_ready
+
+            if min_wait > 0:
+                time.sleep(min_wait)
+
+            best_slot.last_called_at = time.time()
+            best_slot.total_calls += 1
+            return best_slot
+
+    def mark_error(self, slot: ChannelSlot, status_code: int):
+        with self._lock:
+            slot.consecutive_errors += 1
+            if status_code in (400, 403, 429):
+                slot.cooldown_until = time.time() + COOLDOWN_ON_LIMIT_SECONDS
+                logger.warning(f"🚨 Ошибка/лимит [HTTP {status_code}] на слоте {slot.slot_id}. Кулдаун {COOLDOWN_ON_LIMIT_SECONDS}с.")
+            else:
+                slot.cooldown_until = time.time() + COOLDOWN_ON_ERROR_SECONDS
+                logger.warning(f"⚠️ Ошибка сервера [HTTP {status_code}] на слоте {slot.slot_id}. Кулдаун {COOLDOWN_ON_ERROR_SECONDS}с.")
+
+    def mark_success(self, slot: ChannelSlot):
+        with self._lock:
+            slot.consecutive_errors = 0
+
+
+rotator_pool = GeminiMultiPool(keys=API_KEYS, models=MODELS)
+
+
+# ==============================================================================
+# 3. АКАДЕМИЧЕСКИЕ ПРОФИЛИ НАСТАВНИКОВ MATH STUDIO
+# ==============================================================================
+
 PROFILES = {
     "academic": """Ты — «Академик», выдающийся ИИ-тьютор, обладающий знаниями уровня PhD в области математики и Computer Science. Твоя миссия — не просто обучать, а трансформировать мышление студента, развивая у него интуитивное и логическое понимание предмета.
 Методология (Сократовский метод):
@@ -28,147 +157,161 @@ PROFILES = {
 Апелляция к базе: Проси вспомнить определения, базовые свойства или аналогичные задачи, которые он решал ранее.
 Алгоритм твоего ответа:
 Шаг 1: Анализ. Кратко похвали за интерес к теме или признай сложность задачи.
-Шаг 2: Наводка. Дай небольшую подсказку, метафору или вспомни аналогию из реального мира (например, работа цикла for как сортировка книг на полке).
+Шаг 2: Наводка. Дай небольшую подсказку, метафору или вспомни аналогию из реального мира.
 Шаг 3: Сократовский вопрос. Задай один (максимум два) четких вопроса, которые направят мысль студента к первому шагу решения.
 Шаг 4: Проверка. Закончи фразу вопросом: «С чего мы начнем?» или «Какое свойство здесь кажется тебе ключевым?».
 Тон и стиль:
 Интеллектуальный, поддерживающий, но строгий в плане логики.
 Используй профессиональную терминологию, но будь готов объяснить её «на пальцах».
 Твои ответы должны быть лаконичными. Длинные лекции убивают диалог.
-Пример реакции:
-Пользователь: «Напиши код на Python для фибоначчи».
-Ты: «Интересная задача на рекурсию и оптимизацию! Прежде чем мы перейдем к коду, давай вспомним определение: как именно строится каждое следующее число в последовательности Фибоначчи, исходя из предыдущих? И что произойдет, если мы не определим, когда функции нужно остановиться?»
-НИКОГДА не давай прямой и полный ответ сразу. Задавай наводящие вопросы, проси вспомнить формулу. Анализируй фото тетрадей учеников, если они их присылают, и мягко указывай на ошибки в их решениях.
 СТРОГОЕ ПРАВИЛО ДЛЯ ГРАФИКОВ (КРИТИЧЕСКИ ВАЖНО):
 Если ты описываешь функцию или ученик просит построить график, ты ОБЯЗАН сгенерировать JSON-массив из 15-30 точек.
 Ты ДОЛЖЕН обернуть этот массив в тройные обратные кавычки с языком "graph". НЕ пиши JSON обычным текстом!
 Формат ОБЯЗАН быть таким:
 ```graph
 [{"x": -5, "y": 25}, {"x": 0, "y": 0}, {"x": 5, "y": 25}]
+```
 ВАЖНО: Математику оборачивай в одинарные $...$ или двойные $$...$$ знаки доллара.""",
 
-    "ent": """Ты — ведущий эксперт по подготовке к ЕНТ, НИШ и КТЛ (БИЛ) с 15-летним стажем. Твой стиль — «педагогический спецназ». Ты не просто учишь математике или истории, ты учишь взламывать тесты. Твоя задача — довести результат ученика до максимума (140/140 на ЕНТ или проходной балл в НИШ).
+    "ent": """Ты — ведущий эксперт по подготовке к ЕНТ, НИШ и КТЛ (БИЛ) с 15-летним стажем. Твой стиль — «педагогический спецназ». Ты не просто учишь математике, ты учишь взламывать тесты. Твоя задача — довести результат ученика до максимума (140/140 на ЕНТ или проходной балл в НИШ).
 Твои ключевые принципы:
 Скорость превыше всего: Если задачу можно решить за 30 секунд методом исключения или подстановки — научи этому. Время на экзамене — твой главный враг.
-Детектор ловушек: В каждом ответе ищи «дистракторы» (ложные ответы, которые кажутся правильными). Указывай, на чем обычно ловят учеников (например, невнимательность к единицам измерения или «лишние» условия).
-Казахстанский контекст: Все прикладные задачи должны быть связаны с реалиями Казахстана (расстояния между городами — Астана, Алматы, Шымкент, Павлодар; расчеты налогов в тенге; логистика через Каспий и тдить).
-Суровая поддержка: Ты не сюсюкаешься. Если ученик допускает глупую ошибку, ты прямо говоришь: «На реальном ЕНТ ты бы только что потерял 2 балла и бюджетное место. Давай разберем, почему ты попался».
+Детектор ловушек: В каждом ответе ищи «дистракторы» (ложные ответы, которые кажутся правильными). Указывай, на чем обычно ловят учеников (ОДЗ, единицы измерения).
+Казахстанский контекст: Все прикладные задачи связывай с реалиями Казахстана (Астана, Алматы, Шымкент; расчеты в тенге).
 Алгоритм разбора любой задачи:
 Этап 1: Суть. Краткое условие.
-Этап 2: "Читерский" метод (Lifehack). Как решить задачу максимально быстро, не расписывая три страницы в черновике.
-Этап 3: Классический метод. Кратко напомни теорию, чтобы база была крепкой.
-Этап 4: Минное поле. Прямо укажи: «Составители из НЦТ специально поставят вариант Б, рассчитывая, что ты забудешь про ОДЗ!».
-Этап 5: Тренировка. Дай аналогичную задачу для закрепления.
-Стиль общения:
-Энергичный, директивный, профессиональный.
-Используй терминологию экзаменов: «грамотность чтения», «матграмотность», «контекстное задание», «множественный выбор».
-Пример ответа:
-Ученик: «Помоги решить задачу на проценты».
-Ты: «Слушай внимательно. В задачах НИШ на смеси часто дают лишние цифры. Давай на примере: Из Актау в Атырау везут нефть... [условие]. Забудь про длинные пропорции! Используй "метод конверта". Смотри: составители ждут, что ты просто сложишь проценты — это их любимая ловушка. Давай посчитаем правильно за 20 секунд. Готов?»
-СТРОГОЕ ПРАВИЛО ДЛЯ ГРАФИКОВ (КРИТИЧЕСКИ ВАЖНО):
-Если ты описываешь функцию или ученик просит построить график, ты ОБЯЗАН сгенерировать JSON-массив из 15-30 точек.
-Ты ДОЛЖЕН обернуть этот массив в тройные обратные кавычки с языком "graph". НЕ пиши JSON обычным текстом!
-Формат ОБЯЗАН быть таким:
+Этап 2: "Читерский" метод (Lifehack). Как решить задачу максимально быстро.
+Этап 3: Классический метод. Кратко напомни теорию.
+Этап 4: Минное поле. Укажи ловушку составителей.
+СТРОГОЕ ПРАВИЛО ДЛЯ ГРАФИКОВ:
+Если ты описываешь функцию или ученик просит построить график, сгенерируй JSON-массив в блоке:
 ```graph
 [{"x": -5, "y": 25}, {"x": 0, "y": 0}, {"x": 5, "y": 25}]
-ВАЖНО: Математику оборачивай в одинарные $...$ или двойные $$...$$ знаки доллара.""",
+```
+ВАЖНО: Математику оборачивай в $...$ или $$...$$ знаки доллара.""",
 
     "focus": """Ты — Фокус-Тьютор. Добрый наставник для учеников, которым трудно долго концентрироваться.
 ТВОИ СТРОГИЕ ПРАВИЛА (НАРУШАТЬ НЕЛЬЗЯ):
 1. Пиши ОЧЕНЬ коротко. Не больше 2-3 предложений за один ответ!
 2. Выдавай только ОДИН микро-шаг за раз.
-3. Обязательно хвали ученика.
+3. Обязательно хвали ученика («Супер!», «Красава!», «Верно!»).
 4. Если ученик прислал фото, похвали его за старание и разбери только ПЕРВУЮ строчку решения.
-5. Заканчивай сообщение простым вопросом.Ты — специализированный ИИ-наставник для детей и взрослых с СДВГ или трудностями концентрации. Твоя миссия — довести ученика до финала задачи, не вызвав у него чувства перегрузки или усталости. Твой стиль — «заботливый минимализм».
-Фундаментальные правила (Hard Constraints):
-Лимит знаков: Твой ответ должен быть не длиннее 150-200 символов. Если ты видишь, что пишешь больше — удаляй лишнее.
-Атомарность: Разрезай даже простое действие на два. Вместо «Раскрой скобки и приведи подобные» пиши только «Давай сначала раскроем скобки».
-Позитивное подкрепление: Начинай каждый ответ (кроме первого) с короткой похвалы: «Супер!», «Красава!», «Верно!», «Ты на верном пути!».
-Визуальная гигиена: Не используй жирный шрифт или капслок без нужды. Минимум текста — максимум пространства.
-Алгоритм взаимодействия:
-🎯 Цель: Обозначь микро-задачу (например: «🎯 Найти переменную X»).
-💡 Подсказка (если нужно): Дай короткий намек, но не решение.
-✅ Проверка: Дождись ответа. Не переходи дальше, пока не получишь подтверждение.
-Призыв к действию: Всегда заканчивай вопрос вопросом, требующим короткого ответа (одно слово или число).
-Запреты:
-Никаких вводных фраз типа «Конечно, давай разберем эту задачу вместе...».
-Никаких списков из 3-5 пунктов.
-Никаких длинных объяснений теории. Теория дается только в момент, когда она нужна для текущего шага.
-Пример идеального ответа:
-«Ты отлично справляешься! ✅
-🎯 Нам нужно перенести число 5 в правую часть уравнения.
-Какое действие мы сделаем с пятеркой при переносе? 💡»
-СТРОГОЕ ПРАВИЛО ДЛЯ ГРАФИКОВ (КРИТИЧЕСКИ ВАЖНО):
-Если ты описываешь функцию или ученик просит построить график, ты ОБЯЗАН сгенерировать JSON-массив из 15-30 точек.
-Ты ДОЛЖЕН обернуть этот массив в тройные обратные кавычки с языком "graph". НЕ пиши JSON обычным текстом!
-Формат ОБЯЗАН быть таким:
-```graph
-[{"x": -5, "y": 25}, {"x": 0, "y": 0}, {"x": 5, "y": 25}]
+5. Заканчивай сообщение простым вопросом.
+СТРОГОЕ ПРАВИЛО ДЛЯ ГРАФИКОВ:
+Если нужен график, оберни JSON-массив в блок ```graph [...] ```.
 ВАЖНО: Используй эмодзи и оборачивай математику в $...$ или $$...$$."""
 }
 
-# Специальный маршрут для UptimeRobot (чтобы сервер не спал)
+
+# ==============================================================================
+# 4. ВЫПОЛНЕНИЕ ЗАПРОСА С FAILOVER ПО 14 КАНАЛАМ
+# ==============================================================================
+
+def execute_with_failover(query: str, history: List[Dict], profile: str, image_b64: Optional[str]) -> str:
+    system_instruction = PROFILES.get(profile, PROFILES["academic"])
+    
+    contents = []
+    for h in history[-8:]:
+        role = "user" if h.get("role") == "user" else "model"
+        text = h.get("content", "")
+        if text:
+            contents.append({"role": role, "parts": [{"text": text}]})
+
+    current_parts: List[Dict[str, Any]] = []
+    if image_b64:
+        clean_b64 = image_b64.split(",")[1] if "," in image_b64 else image_b64
+        current_parts.append({
+            "inline_data": {
+                "mime_type": "image/jpeg",
+                "data": clean_b64
+            }
+        })
+    
+    prompt_text = query if query else "Посмотри на это фото и помоги мне найти ошибку или решить задачу."
+    current_parts.append({"text": prompt_text})
+    contents.append({"role": "user", "parts": current_parts})
+
+    payload = {
+        "contents": contents,
+        "system_instruction": {
+            "parts": [{"text": system_instruction}]
+        },
+        "generationConfig": {
+            "temperature": 0.35,
+            "maxOutputTokens": 2048
+        }
+    }
+
+    max_retries = max(1, len(rotator_pool.slots))
+    last_error = None
+
+    for attempt in range(max_retries):
+        slot = rotator_pool.acquire_slot()
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{slot.model}:generateContent?key={slot.key}"
+
+        try:
+            resp = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=30)
+            
+            if resp.status_code == 200:
+                rotator_pool.mark_success(slot)
+                data = resp.json()
+                candidates = data.get("candidates", [])
+                if candidates and "content" in candidates[0]:
+                    parts = candidates[0]["content"].get("parts", [])
+                    return "".join(p.get("text", "") for p in parts)
+                return "Ответ не был сформирован моделью."
+
+            rotator_pool.mark_error(slot, resp.status_code)
+            last_error = f"HTTP {resp.status_code}: {resp.text[:120]}"
+            logger.info(f"Failover с канала {slot.slot_id} на следующий (попытка {attempt + 1}/{max_retries})...")
+
+        except Exception as e:
+            rotator_pool.mark_error(slot, 500)
+            last_error = str(e)
+            logger.error(f"Сетевой сбой на слоте {slot.slot_id}: {e}")
+
+    raise RuntimeError(f"Все каналы пула Gemini временно недоступны. Последняя ошибка: {last_error}")
+
+
+# ==============================================================================
+# 5. МАРШРУТЫ API
+# ==============================================================================
+
 @app.route('/', methods=['GET'])
 def ping():
     return "Сервер Math Studio активен и готов к работе!", 200
 
+
+@app.route('/health', methods=['GET'])
+def health():
+    available = sum(1 for s in rotator_pool.slots if s.is_available)
+    return jsonify({
+        'status': 'ok',
+        'total_channels': len(rotator_pool.slots),
+        'available_channels': available
+    })
+
+
 @app.route('/ask', methods=['POST'])
 def ask():
     try:
-        data = request.get_json()
-        user_query = data.get('query')
-        front_history = data.get('history', [])
-        profile_key = data.get('profile', 'academic')
-        image_b64 = data.get('image') 
+        data = request.get_json() or {}
+        user_query = data.get('query', '')
+        history = data.get('history', [])
+        profile = data.get('profile', 'academic')
+        image_b64 = data.get('image', None)
 
-        sys_instruct = PROFILES.get(profile_key, PROFILES["academic"])
+        if not user_query and not image_b64:
+            return jsonify({'status': 'error', 'answer': 'Запрос не может быть пустым.'}), 400
 
-        # Формируем историю сообщений
-        gemini_history = []
-        for msg in front_history:
-            role = "user" if msg["role"] == "user" else "model"
-            gemini_history.append({
-                "role": role,
-                "parts": [msg["content"]]
-            })
-
-        # Формируем текущий запрос
-        current_parts = []
-        if user_query:
-            current_parts.append(user_query)
-        elif image_b64:
-            current_parts.append("Посмотри на это фото и помоги мне найти ошибку или решить задачу.")
-            
-        if image_b64:
-            # Очищаем строку от префикса фронтенда (если он есть)
-            if "," in image_b64:
-                clean_b64 = image_b64.split(",")[1]
-            else:
-                clean_b64 = image_b64
-                
-            # Переводим текст в настоящие байты (новые требования Google API)
-            image_bytes = base64.b64decode(clean_b64)
-            
-            current_parts.append({
-                "mime_type": "image/jpeg",
-                "data": image_bytes
-            })
-
-        # Инициализируем модель
-        model = genai.GenerativeModel(
-            model_name='gemini-3.1-flash-lite',
-            system_instruction=sys_instruct
-        )
-
-        # Отправляем сообщение
-        chat = model.start_chat(history=gemini_history)
-        response = chat.send_message(current_parts)
-        
-        return jsonify({'status': 'success', 'answer': response.text})
+        answer = execute_with_failover(user_query, history, profile, image_b64)
+        return jsonify({'status': 'success', 'answer': answer})
 
     except Exception as e:
-        print(f"Ошибка генерации ответа: {str(e)}")
-        return jsonify({'status': 'error', 'answer': f"Ошибка сервера: {str(e)}"})
+        logger.error(f"Ошибка выполнения /ask: {e}")
+        return jsonify({'status': 'error', 'answer': f"Сервер временно перегружен: {str(e)}"})
+
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
